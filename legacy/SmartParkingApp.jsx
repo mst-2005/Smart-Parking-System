@@ -1,0 +1,1356 @@
+import { useState, useEffect, useMemo, useCallback, createContext, useContext } from "react";
+
+// ─── App Context ────────────────────────────────────────────────────────────
+const AppContext = createContext(null);
+const useAppContext = () => useContext(AppContext);
+const useTheme = useAppContext;
+
+const THEMES = {
+  indigo: { name: "Indigo", emoji: "💜", primary: "#6366f1", primaryHover: "#4f46e5", primaryLight: "#ede9fe", primaryText: "#4338ca", accent: "#8b5cf6", appBg: "#eef2ff" },
+  sky: { name: "Sky", emoji: "🔵", primary: "#0ea5e9", primaryHover: "#0284c7", primaryLight: "#e0f2fe", primaryText: "#0369a1", accent: "#38bdf8", appBg: "#e0f7ff" },
+  emerald: { name: "Emerald", emoji: "💚", primary: "#10b981", primaryHover: "#059669", primaryLight: "#d1fae5", primaryText: "#065f46", accent: "#34d399", appBg: "#ecfdf5" },
+  rose: { name: "Rose", emoji: "🌸", primary: "#f43f5e", primaryHover: "#e11d48", primaryLight: "#ffe4e6", primaryText: "#be123c", accent: "#fb7185", appBg: "#fce7f3" },
+  amber: { name: "Amber", emoji: "🟡", primary: "#f59e0b", primaryHover: "#d97706", primaryLight: "#fef3c7", primaryText: "#92400e", accent: "#fbbf24", appBg: "#fef9c3" },
+  slate: { name: "Slate", emoji: "🩶", primary: "#475569", primaryHover: "#334155", primaryLight: "#f1f5f9", primaryText: "#1e293b", accent: "#64748b", appBg: "#f1f5f9" },
+};
+
+const BG_THEMES = {
+  light: { name: "Light Mode", appBg: "#f8fafc", cardBg: "white", border: "#e2e8f0", hoverBg: "#f1f5f9", hoverBorder: "#cbd5e1" },
+  dark: { name: "Dark Mode", appBg: "#020617", cardBg: "#0f172a", border: "#1e293b", hoverBg: "#1e293b", hoverBorder: "#334155" },
+  dim: { name: "Dim Mode", appBg: "#1c1917", cardBg: "#292524", border: "#44403c", hoverBg: "#44403c", hoverBorder: "#57534e" },
+  pure: { name: "Pure White", appBg: "white", cardBg: "#fafafa", border: "#f1f5f9", hoverBg: "#f8fafc", hoverBorder: "#e2e8f0" }
+};
+
+// ─── Data ─────────────────────────────────────────────────────────────────────
+const zones = [
+  { id: "A", name: "Zone A", description: "Main entrance – covered parking", totalSpaces: 30, distance: 0.3, availablePercent: 59, optimalVehicle: "four-wheeler" },
+  { id: "B", name: "Zone B", description: "East wing – open air parking", totalSpaces: 25, distance: 0.7, availablePercent: 76, optimalVehicle: "two-wheeler" },
+  { id: "C", name: "Zone C", description: "Basement level – EV charging available", totalSpaces: 20, distance: 1.1, availablePercent: 33, optimalVehicle: "ev" },
+  { id: "D", name: "Zone D", description: "North block – two-wheeler priority", totalSpaces: 40, distance: 1.8, availablePercent: 50, optimalVehicle: "two-wheeler" },
+];
+const vehicleTypes = [
+  { id: "two-wheeler", label: "Two Wheeler", emoji: "🛵" },
+  { id: "four-wheeler", label: "Four Wheeler", emoji: "🚗" },
+  { id: "ev", label: "Electric Vehicle", emoji: "⚡" },
+];
+
+const USER_PLACE = "Main Entrance - Gate 1";
+
+// ─── PRNG ─────────────────────────────────────────────────────────────────────
+function hashSeed(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function mulberry32(seed) { return () => { let t = (seed += 0x6d2b79f5); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function shuffledIndices(len, key) { const r = mulberry32(hashSeed(key)), a = Array.from({ length: len }, (_, i) => i); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1));[a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+function generateSlots(zoneId, vehicleType) {
+  const zone = zones.find(z => z.id === zoneId); if (!zone) return [];
+  const count = Math.min(zone.totalSpaces, 40);
+  const rand = mulberry32(hashSeed(`${zoneId}:${vehicleType}`));
+  const fo = ["5-10 min", "10-20 min", "20-30 min", "30-45 min"];
+  return Array.from({ length: count }, (_, i) => {
+    const occ = rand() > 0.45;
+    const dist = (parseFloat(zone.distance) + (i * 0.005)).toFixed(2);
+    const walkMins = Math.ceil((dist / 4.5) * 60);
+    return {
+      id: `${zoneId}-${i + 1}`, occupied: occ, vehicleType,
+      distanceFromOrigin: dist + " km",
+      walkTime: walkMins + " min walk",
+      occupiedDuration: occ ? Math.floor(rand() * 240) + 10 : undefined,
+      expectedFreeIn: occ ? fo[Math.floor(rand() * 4)] : undefined,
+      expectedOccupiedIn: !occ ? fo[Math.floor(rand() * 4)] : undefined,
+      aiConfidence: occ ? Math.floor(rand() * 30) + 60 : undefined
+    };
+  });
+}
+
+// ─── Price Prediction ─────────────────────────────────────────────────────────
+function predictPrice({ durationHrs, peakHour, isWeekend, isRain, zoneId, pricing, vehicleType }) {
+  const base = parseInt(pricing[vehicleType]?.amount) || 40;
+  let mul = 1.0;
+  if (peakHour >= 8 && peakHour <= 10) mul += 0.3;
+  if (peakHour >= 17 && peakHour <= 20) mul += 0.35;
+  if (isWeekend) mul += 0.2;
+  if (isRain) mul += 0.15; // Kept in logic but hidden from UI as requested
+  if (zoneId === "C") mul += 0.1;
+  if (zoneId === "A") mul += 0.05;
+  const rate = Math.round(base * mul);
+  const total = pricing[vehicleType]?.model === "per_entry" ? rate : Math.round(rate * durationHrs * 10) / 10;
+  const unit = pricing[vehicleType]?.model === "per_entry" ? "/visit" : "/hr";
+  const breakdown = [
+    { label: "Base rate", value: `₹${base}${unit}` },
+    peakHour >= 8 && peakHour <= 10 ? { label: "Morning peak surcharge", value: "+30%" } : null,
+    peakHour >= 17 && peakHour <= 20 ? { label: "Evening surge", value: "+35%" } : null,
+    isWeekend ? { label: "Weekend pricing", value: "+20%" } : null,
+    zoneId === "C" ? { label: "Premium zone (EV)", value: "+10%" } : null,
+    zoneId === "A" ? { label: "Prime location", value: "+5%" } : null,
+  ].filter(Boolean);
+  return { pph: rate, total, mul, breakdown, unit };
+}
+
+// ─── Time Overlap Helper ──────────────────────────────────────────────────────
+function isTimeOverlap(b1, b2) {
+  if (b1.slotId !== b2.slotId) return false;
+  if (b1.status === "cancelled" || b1.status === "refunded" || b2.status === "cancelled" || b2.status === "refunded") return false;
+
+  const start1 = new Date(`${b1.date}T${b1.time}`).getTime();
+  const end1 = start1 + (parseFloat(b1.duration) * 3600000);
+
+  const start2 = new Date(`${b2.date}T${b2.time}`).getTime();
+  const end2 = start2 + (parseFloat(b2.duration) * 3600000);
+
+  return start1 < end2 && start2 < end1;
+}
+
+// ─── Heuristic Occupancy ──────────────────────────────────────────────────────
+function runHeuristic({ date = "", duration = 2 }) {
+  // Simple heuristic based on day of week and duration
+  const day = new Date(date).getDay();
+  const isWeekend = day === 0 || day === 6;
+
+  // Base occupancy probability
+  let prob = isWeekend ? 0.6 : 0.4;
+
+  // Duration influence (longer stays fill up slots more)
+  prob += (duration / 24) * 0.3;
+
+  // Add small random jitter for simulation feel
+  prob += (Math.random() * 0.1) - 0.05;
+
+  const occ = Math.round(Math.min(0.95, Math.max(0.05, prob)) * 100);
+
+  return {
+    occupancy_percent: occ
+  };
+}
+
+// ─── CSS factory ─────────────────────────────────────────────────────────────
+function makeCSS(t) {
+  return `
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Inter',sans-serif;color:${t.textColor};}
+.app{min-height:100vh;padding:16px;background:${t.appBg};}
+.container{max-width:530px;margin:0 auto;}
+.container-wide{max-width:920px;margin:0 auto;}
+.topbar{display:flex;justify-content:flex-end;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border-radius:9px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid ${t.borderColor};background:${t.cardBg};color:${t.textColor};transition:all .15s;}
+.btn:hover{background:${t.hoverBg};border-color:${t.hoverBorder};}
+.btn-primary{background:${t.primary};color:white;border-color:${t.primary};}
+.btn-primary:hover{background:${t.primaryHover};}
+.btn-ghost{background:transparent;border-color:transparent;}
+.btn-ghost:hover{background:${t.hoverBg};}
+.btn-danger{background:#ef4444;color:white;border-color:#ef4444;}
+.btn-danger:hover{background:#dc2626;}
+.btn-success{background:#22c55e;color:white;border-color:#22c55e;}
+.btn-success:hover{background:#16a34a;}
+.btn-wide{width:100%;justify-content:center;padding:13px;font-size:15px;border-radius:13px;}
+.btn-back{padding:0;background:transparent;border:none;color:#64748b;font-size:14px;cursor:pointer;}
+.btn-back:hover{color:${t.textColor};}
+.btn:disabled{opacity:.45;cursor:not-allowed;}
+.header{text-align:center;margin-bottom:28px;}
+.header-icon{width:64px;height:64px;background:${t.primaryLight};border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-size:28px;}
+.header h1{font-size:28px;font-weight:800;color:${t.textColor};}
+.header p{color:#64748b;font-size:14px;margin-top:6px;}
+.card{background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:14px;overflow:hidden;}
+.cp{padding:16px;}
+.ctitle{font-size:15px;font-weight:600;color:${t.textColor};margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+.zone-card{background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:14px;padding:16px;cursor:pointer;transition:all .15s;text-align:left;width:100%;display:flex;justify-content:space-between;align-items:center;}
+.zone-card:hover{border-color:${t.primary};box-shadow:0 2px 14px ${t.primary}22;}
+.badge-av{background:#f0fdf4;color:#16a34a;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;}
+.badge-d{background:${t.hoverBg};border:1px solid ${t.borderColor};font-size:12px;font-weight:500;padding:4px 10px;border-radius:8px;color:${t.textColor};}
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px;}
+.sbox{border-radius:14px;padding:14px;text-align:center;}
+.snum{font-size:22px;font-weight:700;}
+.slbl{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;margin-top:4px;}
+.pbar{height:8px;background:${t.borderColor};border-radius:99px;overflow:hidden;}
+.pfill{height:100%;border-radius:99px;transition:width .5s;}
+.slot-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;}
+@media(min-width:400px){.slot-grid{grid-template-columns:repeat(6,1fr);}}
+.slot{aspect-ratio:1;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;cursor:pointer;border:none;transition:transform .12s,box-shadow .12s;position:relative;}
+.slot:hover{transform:scale(1.1);box-shadow:0 2px 8px #0003;}
+.slot.av{background:#dcfce7;color:#166534;border:1.5px solid #86efac;}
+.slot.occ{background:#fee2e2;color:#991b1b;}
+.slot.bk{background:${t.primaryLight};color:${t.primaryText};border:1.5px solid ${t.primary};}
+.slot.ni{cursor:default;}.slot.ni:hover{transform:none;box-shadow:none;}
+.vehicle-card{background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:14px;padding:16px;cursor:pointer;transition:all .15s;text-align:left;width:100%;display:flex;align-items:center;justify-content:space-between;}
+.vehicle-card:hover{border-color:${t.primary};box-shadow:0 2px 12px ${t.primary}18;}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.fg label{display:block;font-size:12px;font-weight:500;color:#475569;margin-bottom:5px;}
+.fg input,.fg select{width:100%;padding:8px 10px;border:1px solid ${t.borderColor};border-radius:9px;font-size:13px;background:${t.cardBg};color:${t.textColor};}
+.fg input:focus,.fg select:focus{outline:none;border-color:${t.primary};}
+.tabs{display:flex;gap:4px;background:${t.hoverBg};padding:4px;border-radius:11px;margin-bottom:18px;}
+.tab{flex:1;padding:8px;border:none;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;background:transparent;color:#64748b;display:flex;align-items:center;justify-content:center;gap:5px;transition:all .15s;}
+.tab.active{background:${t.cardBg};color:${t.textColor};box-shadow:0 1px 4px #0001;}
+.chips{display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap;}
+.chip{padding:5px 14px;border-radius:20px;font-size:12px;font-weight:500;border:1px solid ${t.borderColor};background:${t.cardBg};cursor:pointer;color:#64748b;transition:all .15s;}
+.chip.active{background:${t.primaryLight};color:${t.primaryText};border-color:${t.primary};}
+.overlay{position:fixed;inset:0;background:#0007;display:flex;align-items:center;justify-content:center;z-index:300;padding:16px;}
+.dialog{background:${t.cardBg};border-radius:20px;width:100%;max-width:420px;padding:24px;position:relative;max-height:90vh;overflow-y:auto;}
+.tgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.tbtn{border:2px solid ${t.borderColor};border-radius:12px;padding:12px 8px;cursor:pointer;background:${t.cardBg};text-align:center;transition:all .15s;font-size:13px;}
+.tbtn:hover{border-color:${t.hoverBorder};} .tbtn.active{border-color:${t.primary};background:${t.primaryLight};}
+.tdot{width:28px;height:28px;border-radius:50%;margin:0 auto 6px;}
+.price-grad{background:linear-gradient(135deg,${t.primary},${t.accent});border-radius:16px;padding:20px;color:white;margin-bottom:16px;}
+.bk-badge{display:inline-flex;align-items:center;gap:5px;background:${t.primaryLight};color:${t.primaryText};border:1px solid ${t.primary};padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;}
+.bk-item{background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:12px;padding:14px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+.st{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;}
+.st-active{background:#dcfce7;color:#166534;}
+.st-cancelled{background:#fee2e2;color:#991b1b;}
+.st-expired{background:${t.hoverBg};color:#64748b;}
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:${t.appBg};position:relative;}
+.about-panel{position:absolute;top:20px;left:20px;width:300px;background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:16px;padding:20px;box-shadow:0 4px 20px rgba(0,0,0,0.08);z-index:10;}
+.about-panel h3{font-size:16px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
+.about-panel p{font-size:13px;color:#64748b;line-height:1.5;margin-bottom:12px;}
+.about-section{margin-bottom:12px;}
+.about-section-title{font-size:12px;font-weight:700;text-transform:uppercase;color:${t.primary};margin-bottom:4px;letter-spacing:0.02em;}
+.login-card{background:${t.cardBg};border:1px solid ${t.borderColor};border-radius:20px;padding:32px;width:100%;max-width:400px;position:relative;z-index:5;}
+.li{width:100%;padding:10px 14px;border:1px solid ${t.borderColor};border-radius:10px;font-size:14px;margin-bottom:12px;}
+.li:focus{outline:none;border-color:${t.primary};}
+.err{background:#fef2f2;color:#dc2626;font-size:13px;padding:8px 12px;border-radius:8px;margin-bottom:12px;}
+.dbtn{width:100%;padding:8px;border:1px solid ${t.borderColor};border-radius:8px;font-size:13px;background:${t.cardBg};cursor:pointer;margin-bottom:6px;color:${t.textColor};transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px;}
+.dbtn:hover{border-color:${t.primary};color:${t.primaryText};background:${t.primaryLight};}
+.fr{display:flex;align-items:center;gap:8px;}
+.fb{display:flex;align-items:center;justify-content:space-between;}
+.fc{display:flex;flex-direction:column;gap:8px;}
+.gs>*+*{margin-top:12px;}
+.mb3{margin-bottom:10px;}.mb4{margin-bottom:14px;}.mb6{margin-bottom:20px;}.mt3{margin-top:10px;}
+.xs{font-size:11px;}.sm{font-size:13px;}.mu{color:#64748b;}.tc{text-align:center;}.fb7{font-weight:700;}
+.fade{animation:fi .2s ease;}@keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1}}
+.sp{animation:sp 1s linear infinite;}@keyframes sp{to{transform:rotate(360deg)}}
+.il{padding-left:20px;}.il li{margin-bottom:8px;font-size:14px;color:#475569;}
+.azg{display:grid;grid-template-columns:1fr;gap:14px;}@media(min-width:600px){.azg{grid-template-columns:1fr 1fr;}}
+.glowing-dot{width:16px;height:16px;background:#facc15;border-radius:50%;box-shadow:0 0 12px #facc15, 0 0 20px #facc15;animation:pulse 1.5s infinite;}
+@keyframes pulse{0%{transform:scale(0.95);box-shadow:0 0 0 0 rgba(250, 204, 21, 0.7);}70%{transform:scale(1);box-shadow:0 0 0 10px rgba(250, 204, 21, 0);}100%{transform:scale(0.95);box-shadow:0 0 0 0 rgba(250, 204, 21, 0);}}
+.graph-container{background:#f1f5f9;border-radius:12px;padding:12px;display:grid;grid-template-columns:repeat(5, 1fr);gap:8px;position:relative;}
+.graph-point{aspect-ratio:1;background:#fff;border:1px solid #e2e8f0;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:10px;transition:all 0.2s;}
+.graph-point:hover{background:#e0f2fe;border-color:#0ea5e9;}
+.graph-point.active{background:#0ea5e9;color:white;border-color:#0ea5e9;}
+.zigzag-label{position:absolute;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;}
+.entrance-label{top:-15px;left:0;}
+.exit-label{bottom:-15px;right:0;}
+.welcome-text{font-size:16px;font-weight:700;}
+`;
+}
+
+// ─── Progress bar ─────────────────────────────────────────────────────────────
+function PBar({ pct, color }) {
+  return <div className="pbar"><div className="pfill" style={{ width: `${pct}%`, background: color }} /></div>;
+}
+
+// ─── Interactive Graph ──────────────────────────────────────────────────────
+function InteractiveGraph({ onSelect, currentPos }) {
+  const points = Array.from({ length: 25 }, (_, i) => ({ id: i, x: i % 5, y: Math.floor(i / 5) }));
+
+  return (
+    <div className="card cp mb4">
+      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+        🗺️ Select Your Current Position (Point the dot)
+      </div>
+      <div className="graph-container">
+        <div className="zigzag-label entrance-label">Entrance</div>
+        <div className="zigzag-label exit-label">Exit</div>
+        {points.map(p => (
+          <div key={p.id}
+            className={`graph-point ${currentPos === p.id ? "active" : ""}`}
+            onClick={() => onSelect(p.id)}>
+            {p.id === 0 && <div className="glowing-dot" />}
+            {p.id !== 0 && (currentPos === p.id ? <div className="glowing-dot" /> : p.id)}
+          </div>
+        ))}
+      </div>
+      <div className="sm mu mt3">Current point: {currentPos === 0 ? "Entrance (Default)" : `Point ${currentPos}`}</div>
+    </div>
+  );
+}
+
+// ─── Theme Picker ─────────────────────────────────────────────────────────────
+function ThemePicker({ onClose }) {
+  const { themeKey, setThemeKey, fontColor, setFontColor, bgThemeKey, setBgThemeKey, t } = useTheme();
+
+  const FONT_COLORS = [
+    { label: "Slate Base", value: "#1e293b" },
+    { label: "White", value: "#f8fafc" },
+    { label: "Dark Gray", value: "#333333" },
+    { label: "Midight Navy", value: "#0f172a" },
+    { label: "Deep Green", value: "#14532d" },
+  ];
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="dialog" onClick={e => e.stopPropagation()} style={{ maxWidth: 360, background: t.cardBg }}>
+        <button onClick={onClose} style={{ position: "absolute", top: 14, right: 14, background: "transparent", border: "none", width: 32, height: 32, cursor: "pointer", fontSize: 16, color: t.textColor }}>✕</button>
+        <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 4, color: t.textColor }}>🎨 Customize Look</div>
+
+        <div className="sm mu mb4" style={{ color: t.textColor, opacity: 0.8 }}>Choose an accent</div>
+        <div className="tgrid mb6">
+          {Object.entries(THEMES).map(([key, th]) => (
+            <button key={key} className={`tbtn ${themeKey === key ? "active" : ""}`} onClick={() => setThemeKey(key)} style={{ borderColor: t.borderColor, background: t.cardBg }}>
+              <div className="tdot" style={{ background: th.primary }} />
+              <div style={{ fontWeight: 600, color: t.textColor }}>{th.emoji} {th.name}</div>
+            </button>
+          ))}
+        </div>
+
+        <div className="sm mu mb4" style={{ color: t.textColor, opacity: 0.8 }}>Choose a background</div>
+        <div className="tgrid mb6">
+          {Object.entries(BG_THEMES).map(([key, th]) => (
+            <button key={key} className={`tbtn ${bgThemeKey === key ? "active" : ""}`} onClick={() => setBgThemeKey(key)} style={{ borderColor: t.borderColor, background: t.cardBg }}>
+              <div style={{ height: 20, width: "100%", background: th.appBg, borderRadius: 4, marginBottom: 6, border: "1px solid " + th.border }} />
+              <div style={{ fontSize: 11, fontWeight: 700, color: t.textColor }}>{th.name}</div>
+            </button>
+          ))}
+        </div>
+
+        <div className="sm mu mb4" style={{ color: t.textColor, opacity: 0.8 }}>Choose a font color</div>
+        <div className="tgrid">
+          {FONT_COLORS.map(fc => (
+            <button key={fc.value} className={`tbtn ${fontColor === fc.value ? "active" : ""}`} onClick={() => setFontColor(fc.value)} style={{ padding: '8px', borderColor: t.borderColor, background: t.cardBg }}>
+              <div style={{ height: 20, width: "100%", background: fc.value, borderRadius: 4, marginBottom: 6, border: "1px solid " + t.borderColor }} />
+              <div style={{ fontSize: 11, fontWeight: 700, color: t.textColor }}>{fc.label}</div>
+            </button>
+          ))}
+        </div>
+
+        <button className="btn btn-primary btn-wide" style={{ marginTop: 16 }} onClick={onClose}>Apply Changes</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Login ────────────────────────────────────────────────────────────────────
+function LoginPage({ onLogin }) {
+  const { t, users, setUsers } = useTheme();
+  const [isSignUp, setIsSignUp] = useState(false);
+  const [em, setEm] = useState(""), [un, setUn] = useState(""), [pw, setPw] = useState(""), [err, setErr] = useState("");
+  const [showAbout, setShowAbout] = useState(false);
+  const [showGooglePicker, setShowGooglePicker] = useState(false);
+
+  // Simulated Device-Linked Emails
+  const deviceAccounts = [
+    { name: "Monisha Roy", email: "monisha.roy@gmail.com", img: "https://ui-avatars.com/api/?name=Monisha+Roy&background=4285F4&color=fff" },
+    { name: "Demo User", email: "demo.parking@gmail.com", img: "https://ui-avatars.com/api/?name=Demo+User&background=34A853&color=fff" }
+  ];
+
+  const go = () => {
+    const emailStr = em.trim().toLowerCase();
+    const userStr = un.trim();
+    if (!em || !pw || (isSignUp && !un)) {
+      setErr("Please fill all fields.");
+      return;
+    }
+    if (isSignUp) {
+      if (users.some(u => u.username?.toLowerCase() === userStr.toLowerCase() || u.email === emailStr)) {
+        setErr("Username or Email already exists.");
+        return;
+      }
+      const newUser = { email: emailStr, username: userStr, password: pw, role: "user" };
+      setUsers(prev => [...prev, newUser]);
+      onLogin(newUser);
+    } else {
+      const u = users.find(u => (u.email === emailStr || u.username === userStr || u.username === emailStr) && u.password === pw);
+      if (u) {
+        onLogin(u);
+      } else {
+        setErr("Invalid credentials.");
+      }
+    }
+  };
+
+  const socialLogin = (provider) => {
+    if (provider === "Google") {
+      setShowGooglePicker(true);
+      return;
+    }
+    const id = prompt(`Enter your ${provider} ID:`, provider === "GitHub" ? "user@github.com" : "user@facebook.com");
+    if (id) {
+      onLogin({ username: id.split('@')[0], role: "user", email: id, provider });
+    }
+  };
+
+  return (
+    <div className="login-wrap">
+      <div className="about-panel fade">
+        <h3>ℹ️ About us</h3>
+        <div className="about-section">
+          <div className="about-section-title">About App</div>
+          <p>PredictPark is an AI-powered smart parking management system that helps you find and book parking slots in real-time.</p>
+        </div>
+        <div className="about-section">
+          <div className="about-section-title">Whom is it useful for</div>
+          <p>Ideal for commuters, travelers, and anyone looking for a guaranteed parking spot without the hassle of searching.</p>
+        </div>
+        <div className="about-section">
+          <div className="about-section-title">Who can access</div>
+          <p>Registered users can book and manage slots, while administrators oversee occupancy and pricing configurations.</p>
+        </div>
+        <div className="about-section">
+          <div className="about-section-title">Navigation Guide</div>
+          <ul style={{ paddingLeft: 14, fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>
+            <li>Select vehicle type & choose suggested zone</li>
+            <li>System automatically picks closest available slot</li>
+            <li>Confirm booking or schedule for future</li>
+            <li>Use AI tools for charge & occupancy predictions</li>
+          </ul>
+        </div>
+        <div className="about-section" style={{ marginBottom: 0 }}>
+          <div className="about-section-title">Google Login</div>
+          <p style={{ marginBottom: 0 }}>Securely access the app using your Google Gmail account for a faster, one-tap experience.</p>
+        </div>
+      </div>
+
+      <div className="login-card fade">
+        <div style={{ textAlign: "center", marginBottom: 20 }}>
+          <div style={{ width: 64, height: 64, background: t.primaryLight, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", fontSize: 28 }}>🅿️</div>
+          <div style={{ fontWeight: 800, fontSize: 24 }}>PredictPark</div>
+          <div className="mu sm" style={{ marginTop: 4 }}>{isSignUp ? "Create a new account" : "Login to your account"}</div>
+        </div>
+        {err && <div className="err" style={{ background: err.includes("successfully") ? "#dcfce7" : "#fef2f2", color: err.includes("successfully") ? "#166534" : "#dc2626" }}>{err}</div>}
+
+        {isSignUp ? (
+          <>
+            <div className="fg mb3"><label>Username</label><input className="li" value={un} onChange={e => setUn(e.target.value)} placeholder="Choose a username" onKeyDown={e => e.key === "Enter" && go()} /></div>
+            <div className="fg mb3"><label>Email ID</label><input className="li" value={em} onChange={e => setEm(e.target.value)} placeholder="you@example.com" onKeyDown={e => e.key === "Enter" && go()} /></div>
+            <div className="fg mb3"><label>Password</label><input className="li" type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && go()} /></div>
+          </>
+        ) : (
+          <>
+            <div className="fg mb3"><label>Username or Email</label><input className="li" value={em} onChange={e => setEm(e.target.value)} placeholder="Email or Username" onKeyDown={e => e.key === "Enter" && go()} /></div>
+            <div className="fg mb3"><label>Password</label><input className="li" type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && go()} /></div>
+          </>
+        )}
+
+        <button className="btn btn-primary btn-wide" style={{ marginBottom: 14 }} onClick={() => go()}>{isSignUp ? "Register" : "Login"}</button>
+
+        <div style={{ margin: "20px 0", display: "flex", alignItems: "center", gap: "10px" }}>
+          <div style={{ flex: 1, height: "1px", background: t.borderColor }}></div>
+          <div style={{ fontSize: "12px", color: "#94a3b8", fontWeight: 600 }}>OR CONTINUE WITH</div>
+          <div style={{ flex: 1, height: "1px", background: t.borderColor }}></div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+          <button className="btn dbtn" onClick={() => socialLogin("Google")} style={{ border: "1px solid #e2e8f0", background: "white", color: "#1e293b" }}>
+            <img src="https://www.gstatic.com/images/branding/product/1x/googleg_48dp.png" width="18" height="18" alt="G" /> Google
+          </button>
+          <button className="btn dbtn" onClick={() => socialLogin("GitHub")} style={{ background: "#24292f", color: "white", border: "1px solid #24292f" }}>
+            <span style={{ fontSize: 18 }}>🐙</span> GitHub
+          </button>
+        </div>
+        <button className="btn dbtn" style={{ width: "100%", marginBottom: 14, background: "#1877f2", color: "white", border: "1px solid #1877f2" }} onClick={() => socialLogin("Facebook")}>
+          <span style={{ fontSize: 18 }}>🔵</span> Login with Facebook
+        </button>
+
+        <div style={{ textAlign: "center", marginTop: 10 }}>
+          <span className="sm mu">{isSignUp ? "Already have an account?" : "Don't have an account?"}</span>
+          <button className="btn-ghost" style={{ border: "none", color: t.primary, fontWeight: 600, marginLeft: 6, background: "transparent", cursor: "pointer", fontSize: 13 }} onClick={() => { setIsSignUp(!isSignUp); setErr(""); setPw(""); setUn(""); setEm(""); }}>
+            {isSignUp ? "Login" : "Register"}
+          </button>
+        </div>
+      </div>
+
+      {showGooglePicker && (
+        <div className="overlay" style={{ background: "rgba(0,0,0,0.4)" }} onClick={() => setShowGooglePicker(false)}>
+          <div className="dialog" onClick={e => e.stopPropagation()} style={{ maxWidth: 360, padding: "32px 0 24px", textAlign: "center", borderRadius: 12 }}>
+            <img src="https://www.gstatic.com/images/branding/product/1x/googleg_48dp.png" width="40" height="40" alt="G" style={{ marginBottom: 12 }} />
+            <div style={{ fontSize: 22, fontWeight: 500, color: "#202124", marginBottom: 6 }}>Choose an account</div>
+            <div style={{ fontSize: 14, color: "#5f6368", marginBottom: 24 }}>to continue to <span style={{ fontWeight: 600 }}>PredictPark</span></div>
+
+            <div style={{ textAlign: "left", maxHeight: 300, overflowY: "auto" }}>
+              {deviceAccounts.map((acc, i) => (
+                <button key={i} className="li-item" style={{
+                  width: "100%", padding: "12px 24px", border: "none", background: "white",
+                  display: "flex", alignItems: "center", gap: 12, cursor: "pointer",
+                  borderBottom: "1px solid #f1f3f4", transition: "background 0.2s"
+                }} onClick={() => onLogin({ username: acc.name, role: "user", email: acc.email, provider: "Google" })}>
+                  <img src={acc.img} width="32" height="32" style={{ borderRadius: "50%" }} alt="" />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "#3c4043" }}>{acc.name}</div>
+                    <div style={{ fontSize: 12, color: "#70757a" }}>{acc.email}</div>
+                  </div>
+                </button>
+              ))}
+              <button className="li-item" style={{
+                width: "100%", padding: "14px 24px", border: "none", background: "white",
+                display: "flex", alignItems: "center", gap: 12, cursor: "pointer", color: "#3c4043"
+              }} onClick={() => { const mail = prompt("Enter Google Email:"); if (mail) onLogin({ username: mail.split('@')[0], role: "user", email: mail, provider: "Google" }); }}>
+                <div style={{ width: 32, height: 32, borderRadius: "50%", background: "#f1f3f4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>👤</div>
+                <div style={{ fontSize: 13, fontWeight: 500 }}>Use another account</div>
+              </button>
+            </div>
+
+            <div style={{ padding: "16px 24px 0", fontSize: 11, color: "#5f6368", lineHeight: 1.5, textAlign: "left" }}>
+              To continue, Google will share your name, email address, language preference, and profile picture with PredictPark.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ─── Zone Selection ───────────────────────────────────────────────────────────
+function ZoneSelection({ onSelect, onBack, vehicleType, bookings, onBook }) {
+  const { pricing, t } = useTheme();
+  const [currentPos] = useState(0);
+  const [bookingSlot, setBookingSlot] = useState(null);
+
+  // Tab States
+  const [activeTab, setActiveTab] = useState("summary"); // summary, price, occupancy
+  const now = new Date();
+  const [inDate, setInDate] = useState(now.toISOString().split("T")[0]);
+  const [inTime, setInTime] = useState(`${String(now.getHours()).padStart(2, "0")}:00`);
+  const [inDur, setInDur] = useState("2");
+
+  // Sort zones by optimal vehicle type first, then by shortest distance
+  const sortedZones = useMemo(() => {
+    return [...zones].sort((a, b) => {
+      if (vehicleType) {
+        const aOpt = a.optimalVehicle === vehicleType ? 0 : 1;
+        const bOpt = b.optimalVehicle === vehicleType ? 0 : 1;
+        if (aOpt !== bOpt) return aOpt - bOpt;
+      }
+      return a.distance - b.distance;
+    });
+  }, [vehicleType]);
+
+  // Filter to ensure availability is considered for "Best"
+  const activeZone = sortedZones[0];
+
+  const handleProceed = () => {
+    if (!activeZone) return;
+    const slots = generateSlots(activeZone.id, vehicleType);
+    const availableSlots = slots.filter(s => !s.occupied && !bookings.some(b => b.slotId === s.id && b.status === "active"));
+
+    if (availableSlots.length > 0) {
+      // Find closest available slot (they are generated in order of distance)
+      const closest = availableSlots[0];
+      setBookingSlot(closest);
+    } else {
+      alert("No available slots found in this zone. Please select another zone.");
+      onBack();
+    }
+  };
+
+  return (
+    <div className="fade">
+      <button className="btn-back mb4" onClick={onBack}>← Back to Vehicle Type</button>
+      <div className="card cp mb4" style={{ background: t.primaryLight, borderColor: t.primary }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: t.primaryText, display: "flex", alignItems: "center", gap: 6 }}>
+          📍 Current Position Detected: <strong>Entrance (Gate 1)</strong>
+        </div>
+      </div>
+
+      <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 14 }}>Best Suggested Zone</div>
+
+      {activeZone && (
+        <div className="fade card cp" style={{ border: `2px solid ${t.primary}`, background: t.cardBg }}>
+          <div className="fb mb4">
+            <div>
+              <div style={{ fontSize: 18, fontWeight: 800 }}>{activeZone.name}</div>
+              <div className="sm mu" style={{ marginTop: 4 }}>{activeZone.description}</div>
+              {activeZone.optimalVehicle === vehicleType && (
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#16a34a", marginTop: 4 }}>✨ Highly Recommended for your {vehicleType}</div>
+              )}
+            </div>
+            <div className="badge-d">📍 {activeZone.distance} km away</div>
+          </div>
+
+          <div className="stat-grid mb4">
+            <div className="sbox" style={{ background: t.appBg }}>
+              <div className="snum" style={{ fontSize: 18 }}>{activeZone.totalSpaces}</div>
+              <div className="slbl">Total</div>
+            </div>
+            <div className="sbox" style={{ background: "#f0fdf4" }}>
+              <div className="snum" style={{ fontSize: 18, color: "#16a34a" }}>{activeZone.availablePercent}</div>
+              <div className="slbl">Available</div>
+            </div>
+          </div>
+          {/* Zone content */}
+          {activeZone && activeTab === "summary" && (
+            <div className="fade card cp mt4" style={{ background: "linear-gradient(135deg, #f8fafc, #f1f5f9)", border: "1px solid " + t.borderColor, borderRadius: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 18 }}>✨</span> AI Real-time Forecast
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16, marginBottom: 16 }}>
+                <div style={{ padding: 12, background: "white", borderRadius: 12, border: "1px solid " + t.borderColor }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 4 }}>Current Price</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: t.primary }}>
+                    ₹{predictPrice({ durationHrs: 1, peakHour: new Date().getHours(), isWeekend: [0, 6].includes(new Date().getDay()), isRain: false, zoneId: activeZone.id, pricing, vehicleType }).total}/hr
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <button className="btn" style={{ fontSize: 12, padding: "10px", background: "white", borderColor: t.primary, color: t.primary }} onClick={() => setActiveTab("price")}>💰 Predict Price</button>
+                <button className="btn" style={{ fontSize: 12, padding: "10px", background: "white", borderColor: t.accent, color: t.accent }} onClick={() => setActiveTab("occupancy")}>🧠 Occupancy AI</button>
+              </div>
+            </div>
+          )}
+
+          {activeZone && activeTab === "price" && (
+            <div className="fade card cp mt4" style={{ border: "2px solid " + t.primary }}>
+              <div className="fb mb4">
+                <div style={{ fontWeight: 800 }}>💰 Price Prediction</div>
+                <button className="btn-ghost" onClick={() => setActiveTab("summary")}>✕ Close</button>
+              </div>
+              <div className="fgrid mb4">
+                <div className="fg"><label>📅 Date</label><input type="date" value={inDate} onChange={e => setInDate(e.target.value)} /></div>
+                <div className="fg"><label>🕐 Time</label><input type="time" value={inTime} onChange={e => setInTime(e.target.value)} /></div>
+                <div className="fg"><label>⏱ Hrs</label><input type="number" value={inDur} onChange={e => setInDur(e.target.value)} min="0.5" step="0.5" /></div>
+              </div>
+              {(() => {
+                const dt = new Date(`${inDate}T${inTime}`);
+                const res = predictPrice({ durationHrs: parseFloat(inDur) || 1, peakHour: dt.getHours(), isWeekend: [0, 6].includes(dt.getDay()), isRain: false, zoneId: activeZone.id, pricing, vehicleType });
+                return (
+                  <div className="price-grad" style={{ padding: 16 }}>
+                    <div style={{ fontSize: 11, opacity: .8, textTransform: "uppercase" }}>Estimated Total</div>
+                    <div style={{ fontSize: 32, fontWeight: 800 }}>₹{res.total}</div>
+                    <div style={{ fontSize: 12, opacity: .9, marginTop: 4 }}>₹{res.pph}{res.unit} based on selected time</div>
+                  </div>
+                );
+              })()}
+              <button className="btn btn-primary btn-wide mt4" onClick={() => setActiveTab("summary")}>Back to Summary</button>
+            </div>
+          )}
+
+          {activeZone && activeTab === "occupancy" && (
+            <div className="fade card cp mt4" style={{ border: "2px solid " + t.accent }}>
+              <div className="fb mb4">
+                <div style={{ fontWeight: 800 }}>🧠 Occupancy AI Forecast</div>
+                <button className="btn-ghost" onClick={() => setActiveTab("summary")}>✕ Close</button>
+              </div>
+              <div className="fgrid mb4">
+                <div className="fg"><label>📅 Forecast Date</label><input type="date" value={inDate} onChange={e => setInDate(e.target.value)} /></div>
+                <div className="fg"><label>🕐 Forecast Time</label><input type="time" value={inTime} onChange={e => setInTime(e.target.value)} /></div>
+              </div>
+
+              <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 10, color: "#64748b" }}>PREDICTED SLOT STATUS</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8, marginBottom: 16 }}>
+                {(() => {
+                  const dt = new Date(`${inDate}T${inTime}`);
+                  const res = runHeuristic({ date: inDate, duration: 1 });
+                  return Array.from({ length: 18 }, (_, i) => {
+                    const occ = Math.random() * 100 < res.occupancy_percent;
+                    return (
+                      <div key={i} style={{ aspectRatio: 1, borderRadius: 6, background: occ ? "#fee2e2" : "#f0fdf4", border: `1px solid ${occ ? "#fecaca" : "#dcfce7"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: occ ? "#991b1b" : "#166534" }}>
+                        {i + 1}
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+              <button className="btn btn-wide mt2" style={{ background: t.accent, color: "white", border: "none" }} onClick={() => setActiveTab("summary")}>Back to Summary</button>
+            </div>
+          )}
+
+          <div className="sm mu tc mt6">
+            The best suggested place is selected based on your distance and availability.
+          </div>
+
+          {bookingSlot && (
+            <BookConfirm slot={bookingSlot} zone={activeZone} vehicleType={vehicleType} bookings={bookings}
+              onCancel={() => setBookingSlot(null)}
+              onConfirm={b => { onBook(b); onSelect(activeZone); setBookingSlot(null); }} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+      // ─── Vehicle Selection ────────────────────────────────────────────────────────
+      function VehicleSelection({onSelect, onBack}) {
+  const {pricing} = useTheme();
+      return (
+      <div className="fade">
+        <button className="btn-back mb4" onClick={onBack}>← Back to Login</button>
+        <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>Welcome!</div>
+        <div className="sm mu mb6">Choose your vehicle type to find the best spot</div>
+        <div className="gs">
+          {vehicleTypes.map(vt => {
+            const p = pricing[vt.id] || { amount: 0, model: "per_hour" };
+            const unit = p.model === "per_entry" ? "/visit" : "/hr";
+            return (
+              <button key={vt.id} className="vehicle-card" onClick={() => onSelect(vt.id)}>
+                <div className="fr"><span style={{ fontSize: 32 }}>{vt.emoji}</span><div><div style={{ fontWeight: 700, fontSize: 15 }}>{vt.label}</div><div className="xs mu" style={{ marginTop: 3 }}>Tap to select</div></div></div>
+                <div style={{ textAlign: "right" }}><div style={{ fontWeight: 700, fontSize: 15 }}>₹{p.amount}{unit}</div><div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>CHARGES</div></div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      );
+}
+
+      // ─── Slot Dialog ──────────────────────────────────────────────────────────────
+      function SlotDialog({slot, zone, vehicleType, onClose, onBook, bookings}) {
+  const {t, pricing, auth} = useTheme();
+      if (!slot) return null;
+  const vt = vehicleTypes.find(v => v.id === vehicleType);
+      const mins = slot.occupiedDuration ?? 0;
+      
+      const slotBookings = (bookings || []).filter(b => b.slotId === slot.id && b.status === "active");
+      const myBookings = slotBookings.filter(b => b.userEmail === auth.email);
+      const allActive = [...slotBookings].sort((a, b) => new Date(`${a.date}T${a.time}`) - new Date(`${b.date}T${b.time}`));
+
+      const p = pricing[vehicleType] || {amount: 40, model: "per_hour" };
+      const charge = p.model === "per_entry" ? p.amount.toFixed(2) : ((mins / 60) * p.amount).toFixed(2);
+
+      return (
+      <div className="overlay" onClick={onClose}>
+        <div className="dialog" onClick={e => e.stopPropagation()}>
+          <button onClick={onClose} style={{ position: "absolute", top: 14, right: 14, background: "#f1f5f9", border: "none", borderRadius: "50%", width: 32, height: 32, cursor: "pointer", fontSize: 16 }}>✕</button>
+          <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 3 }}>{slot.occupied ? "🔴" : "🟢"} Slot {slot.id.split("-")[1]}</div>
+          <div className="sm mu mb4">{zone.name} · {vt?.emoji} {vt?.label}</div>
+
+          <div className="fb mb3" style={{ background: t.cardBg, borderColor: t.borderColor, border: "1px solid " + t.borderColor, borderRadius: 12, padding: "10px 14px" }}>
+            <div><div style={{ fontWeight: 600, fontSize: 13, color: t.textColor }}>📍 Distance</div><div className="xs mu">{slot.distanceFromOrigin}</div></div>
+            <div style={{ textAlign: "right" }}><div style={{ fontWeight: 600, fontSize: 13, color: t.textColor }}>🚶 Walk Time</div><div className="xs mu">{slot.walkTime}</div></div>
+          </div>
+
+          <div className="card cp mb3" style={{ background: slot.occupied ? "#fef2f2" : "#f0fdf4", borderColor: slot.occupied ? "#fecaca" : "#bbf7d0" }}>
+            <div style={{ fontWeight: 600, color: slot.occupied ? "#dc2626" : "#16a34a" }}>
+              {slot.occupied ? "🔴 Physically Occupied" : "🟢 Available for entry"}
+            </div>
+            {slot.occupied && <div className="fb mt3" style={{ background: "white", borderRadius: 8, padding: "10px 12px", color: "#1e293b" }}><span className="sm mu">⏱ Time elapsed</span><span style={{ fontWeight: 700 }}>{mins} min</span></div>}
+          </div>
+
+          {allActive.length > 0 && (
+            <div className="mb3">
+              <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 8, color: t.primary }}>📅 Scheduled Reservations</div>
+              <div className="fc" style={{ gap: 6 }}>
+                {allActive.map(b => (
+                  <div key={b.bookingId} className="fb sm" style={{ padding: "8px 10px", background: b.userEmail === auth.email ? t.primaryLight : t.hoverBg, borderRadius: 8, border: `1px solid ${b.userEmail === auth.email ? t.primary : t.borderColor}` }}>
+                    <span style={{ fontWeight: 500 }}>{b.date} at {b.time} ({b.duration}h)</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: b.userEmail === auth.email ? t.primary : "#64748b" }}>
+                      {b.userEmail === auth.email ? "YOU" : "RESERVED"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!slot.occupied ? (
+            <button className="btn btn-success btn-wide" onClick={() => { onBook(slot); onClose(); }}>
+              {myBookings.length > 0 ? "📅 Book Another Slot/Time" : "📅 Book This Slot"}
+            </button>
+          ) : (
+            <div className="card cp" style={{ borderColor: "#fde68a", background: "#fefce8" }}>
+              <div className="xs" style={{ color: "#92400e" }}>💡 <strong>Note:</strong> Slot is physically occupied. You can still reserve it for a later time.</div>
+              <button className="btn btn-wide mt3" style={{ background: "#92400e", color: "white", border: "none" }} onClick={() => { onBook(slot); onClose(); }}>📅 Book for later</button>
+            </div>
+          )}
+        </div>
+      </div>
+      );
+}
+
+      // ─── Booking Confirm Dialog ───────────────────────────────────────────────────
+      function BookConfirm({slot, zone, vehicleType, onConfirm, onCancel, bookings}) {
+  const {t, pricing} = useTheme();
+      const [dur, setDur] = useState("2");
+      const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+      const [time, setTime] = useState(`${String(new Date().getHours()).padStart(2, "0")}:00`);
+
+      const hrs = Math.max(0.5, parseFloat(dur) || 1);
+      const vt = vehicleTypes.find(v => v.id === vehicleType);
+
+      const prediction = useMemo(() => {
+        const dt = new Date(`${date}T${time}`);
+      return predictPrice({
+        durationHrs: hrs,
+      peakHour: dt.getHours(),
+      isWeekend: [0, 6].includes(dt.getDay()),
+      isRain: false,
+      zoneId: zone.id,
+      pricing,
+      vehicleType
+        });
+      }, [date, time, hrs, zone.id, pricing, vehicleType]);
+
+      const est = prediction.total.toFixed(2);
+
+      const handleConfirm = () => {
+        const newBooking = {slotId: slot.id, zone, vehicleType, date, time, duration: hrs, status: "active" };
+
+        // Check for overlaps in existing bookings
+        const hasOverlap = bookings.some(b => isTimeOverlap(b, newBooking));
+
+      if (hasOverlap) {
+        alert("This slot is already booked for the selected duration. Please choose another time or slot.");
+      return;
+        }
+
+      onConfirm({...newBooking, estimatedCharge: est, bookingId: `BK-${Date.now().toString(36).toUpperCase()}`, bookedAt: new Date().toISOString() });
+      };
+
+      return (
+      <div className="overlay">
+        <div className="dialog" style={{ maxWidth: 400 }}>
+          <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 3 }}>📅 Confirm Booking</div>
+          <div className="sm mu mb4">{zone.name} · Slot {slot.id.split("-")[1]} · {vt?.emoji} {vt?.label}</div>
+          <div className="fgrid mb4">
+            <div className="fg"><label>📅 Date</label><input type="date" value={date} onChange={e => setDate(e.target.value)} min={new Date().toISOString().split("T")[0]} /></div>
+            <div className="fg"><label>🕐 Time</label><input type="time" value={time} onChange={e => setTime(e.target.value)} /></div>
+            {(pricing[vehicleType]?.model === "per_hour") && <div className="fg" style={{ gridColumn: "1/-1" }}><label>⏱ Duration (hours)</label><input type="number" value={dur} onChange={e => setDur(e.target.value)} min="0.5" step="0.5" /></div>}
+          </div>
+          <div className="fb" style={{ background: t.primaryLight, borderRadius: 12, padding: "12px 14px", marginBottom: 16 }}>
+            <div>
+              <span style={{ fontWeight: 600 }}>Charges Total</span>
+              {prediction.mul > 1 && <div className="xs" style={{ color: t.primaryText, opacity: 0.8 }}>Includes {Math.round((prediction.mul - 1) * 100)}% AI surcharges</div>}
+            </div>
+            <span style={{ fontWeight: 800, fontSize: 18, color: t.primaryText }}>₹{est}</span>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-wide" style={{ flex: 1 }} onClick={onCancel}>Cancel</button>
+            <button className="btn btn-success btn-wide" style={{ flex: 2 }} onClick={handleConfirm}>✅ Confirm</button>
+          </div>
+        </div>
+      </div>
+      );
+}
+
+      // ─── My Bookings ──────────────────────────────────────────────────────────────
+      function MyBookings({bookings, onCancel, onBack}) {
+  const active = bookings.filter(b => b.status === "active");
+  const past = bookings.filter(b => b.status !== "active");
+      const Section = ({title, items}) => items.length === 0 ? null : (
+      <div className="mb6">
+        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12 }}>{title} ({items.length})</div>
+        {items.map(b => (
+          <div key={b.bookingId} className="bk-item">
+            <div>
+              <div className="fr mb3"><span style={{ fontWeight: 700 }}>{b.zone.name} – Slot {b.slotId.split("-")[1]}</span>
+                <span className={`st st-${b.status}`}>{b.status === "active" ? "✅ Active" : b.status === "cancelled" ? "❌ Cancelled" : b.status === "refunded" ? "💰 Refunded" : "⌛ Expired"}</span>
+              </div>
+              <div className="xs mu">{b.date} {b.time} · {b.duration}h · {vehicleTypes.find(v => v.id === b.vehicleType)?.emoji} {b.vehicleType}</div>
+              <div className="xs" style={{ marginTop: 3 }}>₹{b.estimatedCharge} · <span style={{ fontFamily: "monospace" }}>{b.bookingId}</span></div>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {b.status === "active" && <button className="btn btn-success" style={{ fontSize: 11, padding: "6px 10px" }} onClick={() => { if (window.confirm("Left early? Get 50% refund on remaining time!")) onCancel(b.bookingId, "refunded") }}>Leave Early</button>}
+              {b.status === "active" && <button className="btn btn-danger" style={{ flexShrink: 0, fontSize: 11, padding: "6px 12px" }} onClick={() => onCancel(b.bookingId, "cancelled")}>Cancel</button>}
+            </div>
+          </div>
+        ))}
+      </div>
+      );
+      return (
+      <div className="fade">
+        <button className="btn-back mb4" onClick={onBack}>← Back</button>
+        <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 4 }}>📋 My Bookings</div>
+        <div className="sm mu mb6">Your parking reservations</div>
+        {!bookings.length
+          ? <div className="card cp tc" style={{ padding: 48 }}><div style={{ fontSize: 40, marginBottom: 12 }}>🅿️</div><div className="mu">No bookings yet. Go book a slot!</div></div>
+          : <><Section title="Active Bookings" items={active} /><Section title="Past & Cancelled" items={past} /></>}
+      </div>
+      );
+}
+
+      // ─── Price Predictor ──────────────────────────────────────────────────────────
+      function PricePredictor({zone, vehicleType, onBack}) {
+  const {t, pricing} = useTheme();
+      const now = new Date(), tod = now.toISOString().split("T")[0];
+      const [date, setDate] = useState(tod);
+      const [time, setTime] = useState(`${String(now.getHours()).padStart(2, "0")}:00`);
+      const [dur, setDur] = useState("2");
+      const [res, setRes] = useState(null);
+  const vt = vehicleTypes.find(v => v.id === vehicleType);
+  const calc = () => {
+    const dt = new Date(`${date}T${time}`);
+      const r = predictPrice({durationHrs: Math.max(.5, parseFloat(dur) || 1), peakHour: dt.getHours(), isWeekend: dt.getDay() === 0 || dt.getDay() === 6, isRain: false, zoneId: zone.id, pricing, vehicleType });
+      setRes(r);
+  };
+      return (
+      <div className="fade">
+        <button className="btn-back mb4" onClick={onBack}>← Back</button>
+        <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 4 }}>💰 Charges Predictor</div>
+        <div className="sm mu mb6">{zone.name} · {vt?.emoji} {vt?.label}</div>
+        <div className="card cp mb4">
+          <div className="ctitle">Enter Parking Details</div>
+          <div className="fgrid mb4">
+            <div className="fg"><label>📅 Entry Date</label><input type="date" value={date} onChange={e => setDate(e.target.value)} min={tod} /></div>
+            <div className="fg"><label>🕐 Entry Time</label><input type="time" value={time} onChange={e => setTime(e.target.value)} /></div>
+            {(pricing[vehicleType] || {}).model === "per_hour" && <div className="fg" style={{ gridColumn: "1/-1" }}><label>⏱ Duration (hours)</label><input type="number" value={dur} onChange={e => setDur(e.target.value)} min="0.5" step="0.5" /></div>}
+          </div>
+          <button className="btn btn-primary btn-wide" onClick={calc}>🔮 Predict Charges</button>
+        </div>
+        {res && (
+          <div className="fade">
+            <div className="price-grad">
+              <div style={{ fontSize: 11, opacity: .8, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6 }}>Charges Total</div>
+              <div style={{ fontSize: 42, fontWeight: 800 }}>₹{res.total}</div>
+              <div style={{ fontSize: 13, opacity: .85, marginTop: 3 }}>₹{res.pph}{res.unit} {(pricing[vehicleType] || {}).model === "per_hour" ? `× ${dur} hrs` : ""} · {((res.mul - 1) * 100).toFixed(0)}% surcharge</div>
+            </div>
+            <div className="card cp mb3">
+              <div className="ctitle">📊 Charges Breakdown</div>
+              <div className="fc">
+                {res.breakdown.map((row, i) => (
+                  <div key={i} className="fb" style={{ padding: "8px 0", borderBottom: i < res.breakdown.length - 1 ? "1px solid #f1f5f9" : "none" }}>
+                    <span className="sm mu">{row.label}</span>
+                    <span style={{ fontWeight: 700, fontSize: 13, color: row.value.startsWith("+") ? "#dc2626" : t.primaryText }}>{row.value}</span>
+                  </div>
+                ))}
+                <div className="fb" style={{ padding: "10px 0", borderTop: "2px solid #e2e8f0", marginTop: 4 }}><span style={{ fontWeight: 700 }}>Effective Rate</span><span style={{ fontWeight: 800, fontSize: 16, color: t.primaryText }}>₹{res.pph}{res.unit}</span></div>
+                <div className="fb" style={{ padding: "12px 14px", background: t.primaryLight, borderRadius: 10 }}>
+                  <span style={{ fontWeight: 700 }}>Total Charges</span>
+                  <span style={{ fontWeight: 800, fontSize: 22, color: t.primaryText }}>₹{res.total}</span>
+                </div>
+              </div>
+            </div>
+            <div className="card cp" style={{ borderColor: "#fde68a", background: "#fefce8" }}>
+              <div className="xs" style={{ color: "#92400e" }}>💡 <strong>Tip:</strong> {res.mul > 1.3 ? "Peak hours detected — park earlier or later to save." : res.mul > 1.1 ? "Moderate surcharge. Prices are reasonable right now." : "Great time to park! Prices are at base rate."}</div>
+            </div>
+          </div>
+        )}
+      </div>
+      );
+}
+
+      // ─── Dashboard ────────────────────────────────────────────────────────────────
+      function Dashboard({zone, vehicleType, onBack, onPredict, onPricePredict, bookings, onBook}) {
+  const {t, pricing, auth} = useTheme();
+      const unit = pricing.model === "per_entry" ? "/visit" : "/hr";
+  const [baseSlots] = useState(() => generateSlots(zone.id, vehicleType));
+      const [localBooked, setLocalBooked] = useState([]);
+      const [selectedSlot, setSelectedSlot] = useState(null);
+      const [bookingSlot, setBookingSlot] = useState(null);
+  const slots = useMemo(() => baseSlots.map(s => {
+    const nowTs = new Date().getTime();
+    const bk = bookings.some(b => {
+      if (b.slotId !== s.id || b.status !== "active") return false;
+      const start = new Date(`${b.date}T${b.time}`).getTime();
+      const end = start + (parseFloat(b.duration) * 3600000);
+      return nowTs >= start && nowTs < end;
+    }) || localBooked.includes(s.id);
+      return {...s, bk};
+  }), [baseSlots, bookings, localBooked]);
+  const total = slots.length, occupied = slots.filter(s => s.occupied).length, available = total - occupied;
+      const rate = Math.round((occupied / total) * 100);
+  const vt = vehicleTypes.find(v => v.id === vehicleType);
+  const bc = rate > 80 ? "#ef4444" : rate > 50 ? "#f59e0b" : "#22c55e";
+  const activeHere = bookings.filter(b => b.status === "active" && b.zone.id === zone.id && b.userEmail === auth.email);
+      return (
+      <div className="fade">
+        <button className="btn-back mb4" onClick={onBack}>← Back</button>
+        <div style={{ fontSize: 24, fontWeight: 800, marginBottom: 3 }}>{zone.name}</div>
+        <div className="sm mu mb6">{zone.description}</div>
+        {activeHere.length > 0 && (
+          <div style={{ border: `2px solid ${t.primary}`, background: t.primaryLight, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>🎫 Your Active Bookings Here</div>
+            {activeHere.map(b => (
+              <div key={b.bookingId} className="fb sm" style={{ marginTop: 6 }}>
+                <span>Slot {b.slotId.split("-")[1]} · {b.date} {b.time} · {b.duration}h</span>
+                <span className="bk-badge">₹{b.estimatedCharge}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="card cp mb6">
+          <div className="fb">
+            <div className="fr"><span style={{ fontSize: 24 }}>{vt?.emoji}</span><span style={{ fontWeight: 700 }}>{vt?.label}</span></div>
+            <div className="fr" style={{ gap: 14 }}>
+              <div style={{ textAlign: "right" }}><div style={{ fontSize: 13, fontWeight: 600, color: t.primaryText }}>📍 {zone.distance}</div><div className="xs mu" style={{ marginTop: 2 }}>from you</div></div>
+              <div style={{ textAlign: "right" }}><div style={{ fontWeight: 700, fontSize: 13 }}>₹{(pricing[vehicleType] || {}).amount}{unit}</div><div className="xs mu" style={{ marginTop: 2 }}>CHARGES</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mb6">
+          <div className="fb mb4">
+            <div style={{ fontWeight: 700 }}>Parking Slots</div>
+            <div style={{ display: "flex", gap: 10, fontSize: 11, color: "#64748b", flexWrap: "wrap" }}>
+              <span><span style={{ width: 9, height: 9, borderRadius: "50%", background: "#22c55e", display: "inline-block", marginRight: 4 }}></span>Free</span>
+              <span><span style={{ width: 9, height: 9, borderRadius: "50%", background: "#ef4444", display: "inline-block", marginRight: 4 }}></span>Occupied</span>
+              <span><span style={{ width: 9, height: 9, borderRadius: "50%", background: t.primary, display: "inline-block", marginRight: 4 }}></span>Booked</span>
+            </div>
+          </div>
+          <div className="card cp" style={{ position: "relative" }}>
+            <div className="zigzag-label entrance-label">Entrance</div>
+            <div className="zigzag-label exit-label">Exit</div>
+            <div className="slot-grid" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
+              {(() => {
+                const rows = [];
+                for (let i = 0; i < slots.length; i += 6) {
+                  const row = slots.slice(i, i + 6);
+                  if ((Math.floor(i / 6)) % 2 !== 0) {
+                    row.reverse();
+                  }
+                  rows.push(...row);
+                }
+                return rows.map(slot => (
+                  <button key={slot.id}
+                    className={`slot ${slot.bk ? "bk" : slot.occupied ? "occ" : "av"}`}
+                    onClick={() => setSelectedSlot(slot)}
+                    title={`Slot ${slot.id.split("-")[1]} — ${slot.bk ? "Booked" : slot.occupied ? "Occupied" : "Available"}\n📍 Distance: ${slot.distanceFromOrigin}`}>
+                    {slot.id.split("-")[1]}
+                    {slot.bk && <span style={{ position: "absolute", top: 1, right: 2, fontSize: 7 }}>★</span>}
+                  </button>
+                ));
+              })()}
+            </div>
+          </div>
+        </div>
+        <div className="card cp mb6" style={{ background: "linear-gradient(to bottom right, " + t.cardBg + ", " + t.appBg + ")" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid " + t.borderColor }}>
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", textTransform: "uppercase" }}>Original Price</div>
+              <div style={{ fontSize: 16, fontWeight: 800 }}>₹{(pricing[vehicleType] || {}).amount}{(pricing[vehicleType] || {}).model === "per_entry" ? "/visit" : "/hr"}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 700, color: t.primary, textTransform: "uppercase" }}>AI Predicted Price</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: t.primary }}>
+                ₹{predictPrice({ durationHrs: 1, peakHour: new Date().getHours(), isWeekend: [0, 6].includes(new Date().getDay()), isRain: false, zoneId: zone.id, pricing, vehicleType }).total}
+                <span style={{ fontSize: 11, fontWeight: 500, color: "#94a3b8" }}> /hr</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+          <button className="btn btn-primary btn-wide" style={{ fontSize: 13 }} onClick={onPricePredict}>💰 Price Predict</button>
+          <button className="btn btn-wide" style={{ background: t.accent, color: "white", border: "none", fontSize: 13 }} onClick={onPredict}>🧠 Occupancy AI</button>
+        </div>
+        {selectedSlot && (
+          <SlotDialog slot={selectedSlot} zone={zone} vehicleType={vehicleType} bookings={bookings}
+            onClose={() => setSelectedSlot(null)}
+            onBook={s => { setSelectedSlot(null); setBookingSlot(s); }} />
+        )}
+        {bookingSlot && (
+          <BookConfirm slot={bookingSlot} zone={zone} vehicleType={vehicleType} bookings={bookings}
+            onCancel={() => setBookingSlot(null)}
+            onConfirm={b => { onBook(b); setLocalBooked(p => [...p, b.slotId]); setBookingSlot(null); }} />
+        )}
+      </div>
+      );
+}
+
+      // ─── Predict Occupancy ────────────────────────────────────────────────────────
+      // ─── Predict Occupancy ────────────────────────────────────────────────────────
+      function PredictOccupancy({zone, vehicleType, onBack}) {
+  const {t} = useTheme();
+      const [loading, setLoading] = useState(false);
+      const [res, setRes] = useState(null);
+
+      // New Parameters Only
+      const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+      const [duration, setDuration] = useState(2);
+
+  const runAI = () => {
+        setLoading(true);
+      setRes(null);
+    setTimeout(() => {
+      const output = runHeuristic({
+        duration: parseInt(duration),
+      date: date
+      });
+      setRes(output);
+      setLoading(false);
+    }, 800);
+  };
+
+  // Simulated Future Occupancy Slots (25 slots)
+  const simulatedSlots = useMemo(() => {
+    if (!res) return [];
+      return Array.from({length: 25 }, (_, i) => ({
+        id: i + 1,
+      occupied: Math.random() < (res.occupancy_percent / 100)
+    }));
+  }, [res]);
+
+      return (
+      <div className="fade" style={{ paddingBottom: 40 }}>
+        <button className="btn-back mb4" onClick={onBack}>← Back to Zone</button>
+
+        {/* 1. SELECTION PANEL */}
+        <div className="card cp mb4">
+          <div className="ctitle">🧠 AI Prediction Controls</div>
+          <div className="gs">
+            <div className="fgrid">
+              <div className="fg">
+                <label>📅 Forecast Date</label>
+                <input type="date" value={date} onChange={e => setDate(e.target.value)} />
+              </div>
+              <div className="fg">
+                <label>⏱ Stay Duration (hrs)</label>
+                <input type="number" min="1" max="24" value={duration} onChange={e => setDuration(e.target.value)} />
+              </div>
+            </div>
+          </div>
+
+          <button className="btn btn-primary btn-wide mt6" style={{ height: 56, fontSize: 18, fontWeight: 700 }} onClick={runAI} disabled={loading}>
+            {loading ? <span className="sp">⟳</span> : "🚀"} {loading ? "Analyzing..." : "Predict Occupancy"}
+          </button>
+        </div>
+
+        {/* 2. FUTURE OCCUPANCY GRID (Only result part kept) */}
+        {res && !loading && (
+          <div className="fade">
+            <div className="card cp mb4">
+              <div className="ctitle">🔮 Future Occupancy</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 10 }}>
+                {simulatedSlots.map(s => (
+                  <div key={s.id} style={{
+                    aspectRatio: "1",
+                    borderRadius: 8,
+                    background: s.occupied ? "#fee2e2" : "#f0fdf4",
+                    border: `1px solid ${s.occupied ? "#fecaca" : "#dcfce7"}`,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: s.occupied ? "#991b1b" : "#166534"
+                  }}>
+                    {s.id}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      );
+}
+
+      // ─── Admin ────────────────────────────────────────────────────────────────────
+      function AdminDash({onBack, bookings}) {
+  const {t, pricing, setPricing, users} = useTheme();
+      const [tab, setTab] = useState("zones");
+
+  const updatePrice = (vId, key, val) => {
+        setPricing(p => ({ ...p, [vId]: { ...p[vId], [key]: key === "amount" ? parseFloat(val) || 0 : val } }));
+  };
+
+      const zo = {A: {total: 30, available: 17, occupied: 13, rate: 43, desc: "Main entrance" }, B: {total: 25, available: 14, occupied: 11, rate: 44, desc: "East wing" }, C: {total: 20, available: 9, occupied: 11, rate: 55, desc: "Basement" }, D: {total: 40, available: 18, occupied: 22, rate: 55, desc: "North block" } };
+  const nonAdminUsers = users.filter(u => u.role !== "admin");
+  const totF = Object.values(zo).reduce((s, z) => s + z.available, 0), totO = Object.values(zo).reduce((s, z) => s + z.occupied, 0), totA = Object.values(zo).reduce((s, z) => s + z.total, 0);
+
+      return (
+      <div className="fade container-wide" style={{ padding: "0 16px" }}>
+        <div className="fb mb6"><div><div style={{ fontWeight: 800, fontSize: 20 }}>🛡️ Admin Dashboard</div><div className="sm mu">Parking management overview</div></div><button className="btn" onClick={onBack}>← Back</button></div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 20 }}>
+          {[[totF, "#22c55e", "Free Slots"], [totO, "#ef4444", "Occupied Slots"], ["24", t.primary, "Bookings Today"], [nonAdminUsers.length, t.accent, "Active Users"]].map(([v, c, l]) => (
+            <div key={l} className="card cp tc"><div style={{ fontSize: 28, fontWeight: 700, color: c }}>{v}</div><div className="xs mu" style={{ marginTop: 4 }}>{l}</div></div>
+          ))}
+        </div>
+        <div className="tabs">
+          {[["zones", "📍 Zones Overview"], ["pricing", "₹ Pricing Settings"], ["users", "👥 User Tracking"], ["bookings", "📅 Booking Tracker"]].map(([k, l]) => (
+            <button key={k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => setTab(k)}>{l}</button>
+          ))}
+        </div>
+        {tab === "zones" && <div className="azg">{zones.map(z => {
+          const s = zo[z.id]; const bc = s.rate > 80 ? "#ef4444" : s.rate > 50 ? "#f59e0b" : "#22c55e"; return (
+            <div key={z.id} className="card cp">
+              <div className="fb mb3"><div style={{ fontWeight: 700 }}>📍 {z.name}</div></div>
+              <div className="sm mu mb3">{s.desc}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, textAlign: "center", background: "#f8fafc", borderRadius: 10, padding: "10px 8px", marginBottom: 12 }}>
+                <div><div style={{ fontWeight: 700, fontSize: 18 }}>{s.total}</div><div className="xs mu">Total</div></div>
+                <div><div style={{ fontWeight: 700, fontSize: 18, color: "#22c55e" }}>{s.available}</div><div className="xs mu">Free</div></div>
+                <div><div style={{ fontWeight: 700, fontSize: 18, color: "#ef4444" }}>{s.occupied}</div><div className="xs mu">Occupied</div></div>
+              </div>
+              <div className="fb mb3"><span className="sm mu">Current Coverage</span><span style={{ fontWeight: 700, fontSize: 13 }}>{s.rate}</span></div>
+              <PBar pct={s.rate} color={bc} />
+            </div>
+          );
+        })}
+        </div>}
+        {tab === "pricing" && <div className="gs">
+          {vehicleTypes.map(vt => {
+            const p = pricing[vt.id] || { model: "per_hour", amount: 40 };
+            return (
+              <div key={vt.id} className="card cp">
+                <div className="ctitle">{vt.emoji} {vt.label} Charges</div>
+                <div className="fgrid">
+                  <div className="fg"><label>Billing Model</label><select value={p.model} onChange={e => updatePrice(vt.id, "model", e.target.value)}><option value="per_entry">Flat per visit</option><option value="per_hour">Per hour</option></select></div>
+                  <div className="fg"><label>Amount (₹)</label><input type="number" value={p.amount} onChange={e => updatePrice(vt.id, "amount", e.target.value)} /></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>}
+        {tab === "users" && <div className="card cp">
+          <div className="ctitle">Registered Users Tracking</div>
+          <div className="fc">
+            {nonAdminUsers.map((u, i) => (
+              <div key={i} className="fb" style={{ padding: "10px 0", borderBottom: i < nonAdminUsers.length - 1 ? "1px solid #f1f5f9" : "none" }}>
+                <div><div style={{ fontWeight: 700 }}>{u.username}</div><div className="xs mu">{u.email}</div></div>
+                <div className={`st st-active`} style={{ fontSize: 10 }}>ONLINE</div>
+              </div>
+            ))}
+          </div>
+        </div>}
+        {tab === "bookings" && <div className="card cp">
+          <div className="ctitle">Dedicated Booking Tracker</div>
+          <div className="fc">
+            {bookings.length === 0 ? <div className="mu sm tc">No bookings found in the system.</div> :
+              bookings.map((b, i) => (
+                <div key={i} className="fb" style={{ padding: "10px 0", borderBottom: i < bookings.length - 1 ? "1px solid #f1f5f9" : "none" }}>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{b.zone.name} - Slot {b.slotId.split("-")[1]}</div>
+                    <div className="xs mu">{b.bookingId} · {b.date} {b.time}</div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontWeight: 700, color: t.primaryText }}>₹{b.estimatedCharge}</div>
+                    <div className="xs mu">{(users.find(u => u.email === b.userEmail) || { username: "System User" }).username}</div>
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>}
+      </div>
+      );
+}
+
+      // ─── Info Page ────────────────────────────────────────────────────────────────
+      function InfoPage({onBack}) {
+  return (
+      <div className="card cp fade" style={{ maxWidth: 580, margin: "0 auto" }}>
+        <button className="btn-back mb4" onClick={onBack}>← Back</button>
+        <div className="fr mb6"><span style={{ fontSize: 32 }}>ℹ️</span><h1 style={{ fontSize: 22, fontWeight: 800 }}>App Information</h1></div>
+        <div style={{ marginBottom: 18 }}><div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>About</div><p className="sm mu">AI-powered parking app with real-time slots, price prediction, occupancy forecasting, and online slot booking.</p></div>
+        <div style={{ marginBottom: 18 }}>
+          <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 8 }}>Navigation</div>
+          <ol className="il sm mu"><li>Select a parking zone.</li><li>Choose your vehicle type.</li><li>Click any green slot to book it.</li><li>Use 💰 Price Predict to estimate your parking cost.</li><li>Use 🧠 Occupancy AI for future availability predictions.</li><li>View 📋 My Bookings to manage reservations.</li><li>Use 🎨 Theme to change the app's colour scheme.</li></ol>
+        </div>
+      </div>
+      );
+}
+
+      // ─── Root ─────────────────────────────────────────────────────────────────────
+      export default function App() {
+  const [themeKey, setThemeKey] = useState(() => localStorage.getItem("pp_theme") || "indigo");
+  const [pricing, setPricing] = useState(() => {
+    const saved = localStorage.getItem("pp_pricing");
+      if (saved) {
+      const data = JSON.parse(saved);
+      if (data["four-wheeler"]) return data;
+    }
+      return {
+        "four-wheeler": {model: "per_hour", amount: 40 },
+      "two-wheeler": {model: "per_hour", amount: 20 },
+      "ev": {model: "per_hour", amount: 30 }
+    };
+  });
+  const [users, setUsers] = useState(() => {
+    const saved = localStorage.getItem("pp_users");
+      return saved ? JSON.parse(saved) : [{email: "admin@gmail.com", username: "admin", password: "admin123", role: "admin" }];
+  });
+      const [fontColor, setFontColor] = useState("#1e293b");
+  const [bgThemeKey, setBgThemeKey] = useState(() => localStorage.getItem("pp_bgTheme") || "light");
+
+  useEffect(() => localStorage.setItem("pp_theme", themeKey), [themeKey]);
+  useEffect(() => localStorage.setItem("pp_pricing", JSON.stringify(pricing)), [pricing]);
+  useEffect(() => localStorage.setItem("pp_users", JSON.stringify(users)), [users]);
+  useEffect(() => localStorage.setItem("pp_bgTheme", bgThemeKey), [bgThemeKey]);
+
+  useEffect(() => {
+    if (bgThemeKey === "dark" || bgThemeKey === "dim") {
+        setFontColor("#f8fafc"); // Light text for dark backgrounds
+    } else {
+        setFontColor("#1e293b"); // Dark text for light backgrounds
+    }
+  }, [bgThemeKey]);
+
+      const b = BG_THEMES[bgThemeKey] || BG_THEMES.light;
+
+      const t = {
+        ...THEMES[themeKey],
+        textColor: fontColor,
+      appBg: b.appBg,
+      cardBg: b.cardBg,
+      borderColor: b.border,
+      hoverBg: b.hoverBg,
+      hoverBorder: b.hoverBorder
+  };
+      const css = makeCSS(t);
+  const [auth, setAuth] = useState(() => {
+    const saved = localStorage.getItem("pp_auth");
+      return saved ? JSON.parse(saved) : null;
+  });
+      const [page, setPage] = useState("zone");
+      const [zone, setZone] = useState(null);
+      const [vehicle, setVehicle] = useState(null);
+  const [bookings, setBookings] = useState(() => {
+    const saved = localStorage.getItem("pp_bookings");
+      return saved ? JSON.parse(saved) : [];
+  });
+      const [showTheme, setShowTheme] = useState(false);
+
+  useEffect(() => {
+    if (auth) localStorage.setItem("pp_auth", JSON.stringify(auth));
+      else localStorage.removeItem("pp_auth");
+  }, [auth]);
+
+  useEffect(() => localStorage.setItem("pp_bookings", JSON.stringify(bookings)), [bookings]);
+
+  const login = useCallback(u => {setAuth(u); setPage("vehicle"); }, []);
+  const logout = () => {setAuth(null); setPage("zone"); setZone(null); setVehicle(null); localStorage.removeItem("pp_auth"); };
+  const addBooking = b => setBookings(p => [{...b, userEmail: auth.email }, ...p]);
+  const cancelBooking = (id, status = "cancelled") => setBookings(p => p.map(b => b.bookingId === id ? {...b, status} : b));
+  const activeCount = bookings.filter(b => b.status === "active").length;
+      const ctx = {themeKey, setThemeKey, fontColor, setFontColor, bgThemeKey, setBgThemeKey, t, pricing, setPricing, users, setUsers, auth, setAuth};
+
+  const ThemeBtn = () => (
+      <button className="btn" onClick={() => setShowTheme(true)} style={{ background: t.primaryLight, borderColor: t.primary, color: t.primaryText }}>🎨 Theme</button>
+      );
+
+  const Topbar = () => (
+      <div className="topbar" style={{ justifyContent: "space-between" }}>
+        <div style={{ fontWeight: 700, fontSize: 13, color: t.primaryText }}>👋 Welcome, {auth?.role === "admin" ? "Admin" : (auth?.username || "User")}</div>
+        <div className="fr" style={{ gap: 7 }}>
+          {auth?.role === "admin" && <button className="btn" onClick={() => setPage("admin")}>🛡️ Admin</button>}
+          <button className="btn" onClick={() => setPage("bookings")} style={{ position: "relative" }}>
+            📋 Bookings {activeCount > 0 && <span style={{ background: "#ef4444", color: "white", borderRadius: "50%", fontSize: 10, fontWeight: 700, width: 18, height: 18, display: "inline-flex", alignItems: "center", justifyContent: "center", marginLeft: 2 }}>{activeCount}</span>}
+          </button>
+          <button className="btn" onClick={() => setPage("info")}>ℹ️ Info</button>
+          <ThemeBtn />
+          <button className="btn btn-ghost" onClick={logout}>↩ Logout</button>
+        </div>
+      </div>
+      );
+
+      if (!auth) return (
+      <AppContext.Provider value={ctx}>
+        <style>{css}</style>
+        <LoginPage onLogin={login} />
+      </AppContext.Provider>
+      );
+
+      const mainPages = ["zone", "vehicle", "dashboard", "predict", "price"];
+      return (
+      <AppContext.Provider value={ctx}>
+        <style>{css}</style>
+        <div className="app">
+          {showTheme && <ThemePicker onClose={() => setShowTheme(false)} />}
+
+          {auth?.role === "admin" ? (
+            <div className="container-wide">
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 7, marginBottom: 12 }}>
+                <ThemeBtn />
+                <button className="btn btn-ghost" onClick={logout}>↩ Logout</button>
+              </div>
+              <AdminDash onBack={() => { }} bookings={bookings} />
+            </div>
+          ) : (
+            <>
+              {page === "info" && <div className="container"><Topbar /><InfoPage onBack={() => setPage("zone")} /></div>}
+              {page === "bookings" && <div className="container"><Topbar /><MyBookings bookings={bookings.filter(b => b.userEmail === auth.email)} onCancel={cancelBooking} onBack={() => setPage("zone")} /></div>}
+              {mainPages.includes(page) && (
+                <div className="container">
+                  <Topbar />
+                  {page === "vehicle" && <VehicleSelection onSelect={v => { setVehicle(v); setPage("zone"); }} onBack={logout} />}
+                  {page === "zone" && vehicle && <ZoneSelection vehicleType={vehicle} bookings={bookings} onBook={addBooking} onSelect={z => { setZone(z); setPage("dashboard"); }} onBack={() => { setVehicle(null); setPage("vehicle"); }} />}
+                  {page === "dashboard" && zone && vehicle && <Dashboard zone={zone} vehicleType={vehicle} bookings={bookings} onBook={addBooking} onBack={() => setPage("zone")} onPredict={() => setPage("predict")} onPricePredict={() => setPage("price")} />}
+                  {page === "predict" && zone && vehicle && <PredictOccupancy zone={zone} vehicleType={vehicle} onBack={() => setPage("dashboard")} />}
+                  {page === "price" && zone && vehicle && <PricePredictor zone={zone} vehicleType={vehicle} onBack={() => setPage("dashboard")} />}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </AppContext.Provider>
+      );
+}
+
