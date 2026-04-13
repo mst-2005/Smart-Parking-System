@@ -1,1 +1,154 @@
-
+{
+  "users": [
+    {
+      "email": "admin@gmail.com",
+      "username": "admin",
+      "password": "admin123",
+      "role": "admin"
+    },
+    {
+      "email": "user@gmail.com",
+      "username": "user",
+      "password": "user123",
+      "role": "user"
+    },
+    {
+      "email": "Admin",
+      "username": "admin@gmail.com",
+      "password": "admin123",
+      "role": "admin"
+    },
+    {
+      "email": "admin@local.com",
+      "username": "Admin",
+      "password": "admin@123",
+      "role": "admin"
+    },
+    {
+      "email": "testuser@example.com",
+      "username": "testuser",
+      "password": "passwordpassword",
+      "role": "user"
+    },
+    {
+      "email": "park.admin@local.com",
+      "username": "park_admin",
+      "password": "park_admin123",
+      "role": "admin"
+    }
+  ],
+  "bookings": [
+    {
+      "slotId": "A-3",
+      "zone": {
+        "id": "A",
+        "name": "Zone A",
+        "description": "Premium convenience – located directly at the Main Entrance with automated sensor tracking.",
+        "totalSpaces": 30,
+        "distance": 0.05,
+        "availablePercent": 59,
+        "optimalVehicle": "four-wheeler"
+      },
+      "vehicleType": "two-wheeler",
+      "date": "2026-04-13",
+      "time": "12:00",
+      "duration": 2,
+      "status": "active",
+      "estimatedCharge": "40.00",
+      "bookingId": "BK-1775879460881",
+      "userEmail": "user@gmail.com"
+    },
+    {
+      "slotId": "C-2",
+      "zone": {
+        "id": "C",
+        "name": "Zone C (For EVs only)",
+        "description": "Basement level - covered parking and EV charging available",
+        "totalSpaces": 20,
+        "distance": 0.68,
+        "availablePercent": 33,
+        "optimalVehicle": "ev"
+      },
+      "vehicleType": "ev",
+      "date": "2026-04-13",
+      "time": "12:00",
+      "duration": 74,
+      "status": "cancelled",
+      "estimatedCharge": "2220.00",
+      "bookingId": "BK-1775847653522",
+      "userEmail": "ps_google@mock.com"
+    },
+    {
+      "slotId": "A-6",
+      "zone": {
+        "id": "A",
+        "name": "Zone A",
+        "description": "Main entrance – covered parking",
+        "totalSpaces": 30,
+        "distance": 0.12,
+        "availablePercent": 59,
+        "optimalVehicle": "four-wheeler"
+      },
+      "vehicleType": "four-wheeler",
+      "date": "2026-04-10",
+      "time": "21:00",
+      "duration": 3,
+      "status": "active",
+      "estimatedCharge": "126.00",
+      "bookingId": "BK-1775838264859",
+      "userEmail": "testuser@example.com"
+    }
+  ],
+  "pricing": {
+    "four-wheeler": {
+      "model": "per_hour",
+      "amount": 40
+    },
+    "two-wheeler": {
+      "model": "per_hour",
+      "amount": 20
+    },
+    "ev": {
+      "model": "per_hour",
+      "amount": 30
+    }
+  },
+  "zones": [
+    {
+      "id": "A",
+      "name": "Zone A",
+      "description": "Premium convenience – located directly at the Main Entrance with automated sensor tracking.",
+      "totalSpaces": 30,
+      "distance": 0.05,
+      "availablePercent": 59,
+      "optimalVehicle": "four-wheeler"
+    },
+    {
+      "id": "B",
+      "name": "Zone B",
+      "description": "East wing – open-air parking facilities with streamlined exit corridors.",
+      "totalSpaces": 25,
+      "distance": 0.22,
+      "availablePercent": 76,
+      "optimalVehicle": "two-wheeler"
+    },
+    {
+      "id": "C",
+      "name": "Zone C (For EVs only)",
+      "description": "Climate-controlled basement with high-speed EV charging infrastructure.",
+      "totalSpaces": 20,
+      "distance": 0.48,
+      "availablePercent": 33,
+      "optimalVehicle": "ev"
+    },
+    {
+      "id": "D",
+      "name": "Zone D",
+      "description": "North block – high-capacity parking for long-term stays and commuters.",
+      "totalSpaces": 40,
+      "distance": 0.85,
+      "availablePercent": 50,
+      "optimalVehicle": "two-wheeler"
+    }
+  ]
+}
